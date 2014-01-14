@@ -1,7 +1,11 @@
 package com.livingsocial.hive.udaf;
 
+import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
@@ -11,100 +15,143 @@ import org.apache.hadoop.hive.ql.exec.UDAFEvaluator;
 
 public class AssignCluster extends UDAF {
 	
+	//Number of clusters, probably should be a parameter somehow
+	private static final int CLUSTER_SIZE = 128;
+
 	/**
-	   * The internal state of an aggregation for average.
-	   * 
-	   * Note that this is only needed if the internal state cannot be represented
-	   * by a primitive.
-	   * 
-	   * The internal state can also contains fields with types like
-	   * ArrayList<String> and HashMap<String,Double> if needed.
-	   */
-	  public static class UDAFAvgState {
-	    private long mCount;
-	    private double mSum;
-	  }
-	  
-	  public static void main(String[] args) throws IOException{
-		  Configuration conf = new Configuration();
-		  System.out.println(conf.get("fs.defaultFS"));
-	  }
-	  
-	  /**
-	   * The actual class for doing the aggregation. Hive will automatically look
-	   * for all internal classes of the UDAF that implements UDAFEvaluator.
-	   */
-	  public static class UDAFExampleAvgEvaluator implements UDAFEvaluator {
-
-	    UDAFAvgState state;
-
-	    public UDAFExampleAvgEvaluator() {
-	      super();
-	      state = new UDAFAvgState();
-	      init();
-	    }
-
-	    /**
-	     * Reset the state of the aggregation.
-	     */
-	    public void init() {
-	      state.mSum = 0;
-	      state.mCount = 0;
-	    }
-
-	    /**
-	     * Iterate through one row of original data.
-	     * 
-	     * The number and type of arguments need to the same as we call this UDAF
-	     * from Hive command line.
-	     * 
-	     * This function should always return true.
-	     */
-	    public boolean iterate(Double o) {
-	      if (o != null) {
-	        state.mSum += o;
-	        state.mCount++;
-	      }
-	      return true;
-	    }
-
-	    /**
-	     * Terminate a partial aggregation and return the state. If the state is a
-	     * primitive, just return primitive Java classes like Integer or String.
-	     */
-	    public UDAFAvgState terminatePartial() {
-	      // This is SQL standard - average of zero items should be null.
-	      return state.mCount == 0 ? null : state;
-	    }
-
-	    /**
-	     * Merge with a partial aggregation.
-	     * 
-	     * This function should always have a single argument which has the same
-	     * type as the return value of terminatePartial().
-	     */
-	    public boolean merge(UDAFAvgState o) {
-	      if (o != null) {
-	        state.mSum += o.mSum;
-	        state.mCount += o.mCount;
-	      }
-	      return true;
-	    }
-
-	    /**
-	     * Terminates the aggregation and return the final result.
-	     */
-	    public Double terminate() {
-	      // This is SQL standard - average of zero items should be null.
-	      return state.mCount == 0 ? null : Double.valueOf(state.mSum
-	          / state.mCount);
-	    }
-	  }
-
-	  private AssignCluster() {
-	    // prevent instantiation
-	  }
-
+	 * The internal state of the aggregation. This keeps stores the similarity
+	 * between the current person vector and each of the cluster centroids.
+	 */
+	public static class UDAFAssignClusterState{
+		ArrayList<Double> similarity = new ArrayList<Double>(CLUSTER_SIZE);
+	}
 	
+	/**
+	 * Loads the cluster centroids from HDFS
+	 * @return The cluster centroids, the array indices correspond to the
+	 * cluster indices. That is, centroids[0] contains the vector for 
+	 * cluster 0.
+	 */
+	 public static Map<String, Double>[] getCentroids(){
+		 return DefaultSetHolder.DEFAULT_STOP_SET;
+	 }
+	 
+	 /*
+	  * Some magical lazy loading, centroids aren't read until 
+	  * getCentoids() is called.
+	  */
+	 private static class DefaultSetHolder {
+		      static final Map<String, Double>[] DEFAULT_STOP_SET = readCentroids();
+	 }
+	 
+	 private static Map<String, Double>[] readCentroids() {
+		 	@SuppressWarnings("unchecked")
+			Map<String, Double>[] entries = new Map[CLUSTER_SIZE];
+			for (int i = 0; i < CLUSTER_SIZE; i++) {
+				entries[i] = new HashMap<String, Double>();
+			}
+			
+			Configuration conf = new Configuration();
+			String root = conf.get("fs.defaultFS");
+			String path = root
+					+ "/user/hive/warehouse/msperlich.db/daily_cluster_centroids128/centroids128_sparse.csv";
+			try{
+			FileSystem fs = FileSystem.get(conf);
+			Path centroidsFile = new Path(path);
+			BufferedReader reader = new BufferedReader(new InputStreamReader(
+					fs.open(centroidsFile)));
+			while(reader.ready()) {
+				String[] tokens = reader.readLine().split(",");
+				int cluster = Integer.parseInt(tokens[0]);
+				String word = tokens[1].intern();
+				double weight = Double.parseDouble(tokens[2]);
+				entries[cluster].put(word, weight);
+			}
+			}
+			catch(IOException e){
+				throw new RuntimeException("Unable to read cluster centrods", e);
+			}
+			
+			return entries;
+
+		}
 	
+	public static class UDAFAssignClusterEvaluator implements UDAFEvaluator {
+		UDAFAssignClusterState state;
+		
+	    public UDAFAssignClusterEvaluator() {
+	        super();
+	        state = new UDAFAssignClusterState();
+	        init();
+	      }
+
+	      /**
+	       * Reset the state of the aggregation. 
+	       * Sets all similarities to zero.
+	       */
+	      public void init() {
+	    	  if(state.similarity.size() == 0){
+	    		  for(int c = 0; c < CLUSTER_SIZE; c++){
+		    		  state.similarity.add(0.0);
+		    	  } 
+	    	  }
+	    	  else{
+	    		  for(int c = 0; c < CLUSTER_SIZE; c++){
+		    		  state.similarity.set(c, 0.0);
+		    	  }
+	    	  }
+	      }
+
+		/**
+		 * Terminate a partial aggregation and return the state.
+		 */
+		public UDAFAssignClusterState terminatePartial() {
+			return state;
+		}
+
+		/**
+		 * Merge with a partial aggregation, similarities are added.
+		 * 
+		 */
+		public boolean merge(UDAFAssignClusterState o) {
+			for (int c = 0; c < CLUSTER_SIZE; c++) {
+				state.similarity.set(c, state.similarity.get(c) + o.similarity.get(c));
+			}
+			return true;
+		}
+
+		public boolean iterate(String word, Double weight) {
+			if (word != null && weight != null) {
+				word = word.intern();
+				Map<String, Double>[] centroids = getCentroids();
+				for (int c = 0; c < CLUSTER_SIZE; c++) {
+					Double clusterWeight = centroids[c].get(word);
+					if (clusterWeight != null) {
+						state.similarity.set(c,  state.similarity.get(c) +  clusterWeight * weight);
+					}
+				}
+			}
+			return true;
+		}
+		
+		/**
+		 * Return the index of the cluster with the highest similarity.
+		 * @return
+		 */
+		public Integer terminate() {
+			int maxIndex = 0;
+			double maxSimilarity = Double.NEGATIVE_INFINITY;
+			for (int c = 0; c < CLUSTER_SIZE; c++) {
+				double similarity = state.similarity.get(c);
+				if (similarity > maxSimilarity) {
+					maxSimilarity = similarity;
+					maxIndex = c;
+				}
+			}
+			return maxIndex;
+		}
+	}
+	
+	private AssignCluster(){
+	}
 }
